@@ -1,0 +1,28 @@
+--- a/modules/lock/LockSurface.qml
++++ b/modules/lock/LockSurface.qml
+@@ -2,6 +2,7 @@
+ 
+ import QtQuick
+ import QtQuick.Effects
++import Quickshell
+ import Quickshell.Wayland
+ import Caelestia.Config
+ import qs.components
+@@ -15,6 +16,8 @@
+     required property Pam pam
+ 
+     readonly property alias unlocking: unlockAnim.running
++    // caelestia-extras: the lock box only lives on the leftmost active screen (topmost on a tie)
++    readonly property bool isLeftmost: Quickshell.screens.every(s => s === screen || s.x > screen.x || (s.x === screen.x && s.y >= screen.y))
+ 
+     contentItem.Config.screen: screen.name
+     contentItem.Tokens.screen: screen.name
+@@ -202,7 +205,7 @@
+         implicitWidth: size
+         implicitHeight: size
+ 
+-        visible: Config.lock.enabled
++        visible: Config.lock.enabled && root.isLeftmost
+         rotation: 180
+         scale: 0
+ 

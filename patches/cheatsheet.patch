@@ -1,0 +1,1006 @@
+--- a/shell.qml
++++ b/shell.qml
+@@ -9,6 +9,7 @@
+ import "modules/background"
+ import "modules/areapicker"
+ import "modules/lock"
++import "modules/cheatsheet" // caelestia-extras (cheatsheet)
+ import QtQuick
+ import Quickshell
+ import qs.services
+@@ -35,6 +36,7 @@
+     }
+ 
+     Shortcuts {}
++    Cheatsheet {} // caelestia-extras (cheatsheet)
+     BatteryMonitor {}
+     IdleMonitors {
+         lock: lock
+--- /dev/null
++++ b/modules/cheatsheet/Cheatsheet.qml
+@@ -0,0 +1,808 @@
++pragma ComponentBehavior: Bound
++
++import QtQuick
++import QtQuick.Layouts
++import Quickshell
++import Quickshell.Hyprland
++import Quickshell.Io
++import Quickshell.Wayland
++import Caelestia.Config
++import Caelestia.I18n
++import qs.components
++import qs.components.containers
++import qs.components.controls
++import qs.components.effects
++import qs.components.misc
++import qs.services
++import "labels.js" as Labels
++
++// caelestia-extras (cheatsheet): searchable keybind overview, toggled by a global shortcut.
++// Everything comes from `hyprctl binds -j`, read on every open. Labels, best first:
++//   1. the bind's own description (hyprlang `bindd`, Lua `{ description = ... }`);
++//      "Category: text" puts it into that category
++//   2. the optional label file $XDG_RUNTIME_DIR/caelestia-cheatsheet.json
++//      (for binds that cannot carry a description, e.g. the Caelestia Lua defaults)
++//   3. hyprlang binds: a readable form of dispatcher + argument
++//   4. anything else is listed under "Unlabelled"
++// Label file entries whose keys are not bound right now are hidden.
++// A swapped Alt/Super (xkb altwin:swap_alt_win / swap_lalt_lwin) swaps the key names.
++Scope {
++    id: root
++
++    property bool open
++    property var fileCategories: []
++    property var bound: ({})
++    property string screenName // monitor picked on open, so the overlay does not follow the focus
++    property bool modsSwapped
++
++    // IPC "search": the open window fills in its search field
++    signal searchRequested(text: string)
++
++    // frosted glass: the card is see-through enough for the blur to show;
++    // without transparency in the shell config everything stays opaque
++    readonly property bool glass: Colours.transparency.enabled
++    readonly property real cardAlpha: glass ? 0.62 : 1
++    readonly property real scrimAlpha: 0.3
++
++    // the windows stay loaded and laid out, so opening only has to fade in
++    Component.onCompleted: {
++        applyBlurRule();
++        updateCategories();
++        refresh();
++    }
++
++    // Nothing is fetched on open, that would run during the fade-in. A config reload
++    // changes the binds (and drops runtime layer rules); hypr-user.lua rewrites the
++    // label file on every reload.
++    function refresh(): void {
++        binds.running = true;
++        devices.running = true;
++    }
++
++    Connections {
++        target: Hypr
++
++        function onConfigReloaded(): void {
++            root.applyBlurRule();
++            root.refresh();
++        }
++    }
++
++    // shownCategories is rebuilt on every source update (labels, hyprctl), mostly with the
++    // same content; categories only changes along with the content, so the grid stays put
++    property var categories: []
++    property string categoriesKey
++
++    onShownCategoriesChanged: updateCategories()
++
++    function updateCategories(): void {
++        const key = JSON.stringify(shownCategories);
++        if (key === categoriesKey)
++            return;
++        categoriesKey = key;
++        categories = shownCategories;
++    }
++
++    // all words of the query must appear in the label, category or the shown key names
++    function filterCategories(query: string): var {
++        const words = query.toLowerCase().split(/\s+/).filter(w => w);
++        if (words.length === 0)
++            return root.categories;
++        const out = [];
++        for (const cat of root.categories) {
++            const binds = cat.binds.filter(b => {
++                const text = `${b.desc} ${cat.title} ${Labels.searchText(b.keys, root.modsSwapped)}`.toLowerCase();
++                return words.every(w => text.includes(w));
++            });
++            if (binds.length > 0)
++                out.push({ title: cat.title, icon: cat.icon, binds });
++        }
++        return out;
++    }
++
++    readonly property var shownCategories: {
++        const claimed = {};
++        const out = [];
++        const byTitle = {};
++        const category = (title, icon) => {
++            const key = title.toLowerCase();
++            if (!byTitle[key]) {
++                byTitle[key] = { title, icon, binds: [] };
++                out.push(byTitle[key]);
++            }
++            return byTitle[key];
++        };
++        // binds with the same label in the same category share one row (unlabelled ones never)
++        const add = (cat, desc, combo) => {
++            const row = desc ? cat.binds.find(b => b.desc === desc) : null;
++            if (row)
++                row.keys.push(combo);
++            else
++                cat.binds.push({ desc, keys: [combo] });
++            claimed[combo] = true;
++        };
++        const combos = Object.keys(root.bound).sort();
++
++        // 1. the bind's own description
++        for (const combo of combos) {
++            const text = root.bound[combo].description;
++            if (!text)
++                continue;
++            const split = text.match(/^([^:]{1,30}):\s*(.+)$/);
++            add(category(split ? split[1] : Tr.tr("Other"), "label"), split ? split[2] : text, combo);
++        }
++
++        // 2. label file
++        for (const fileCat of root.fileCategories) {
++            for (const b of fileCat.binds ?? []) {
++                const match = (b.match ?? []).filter(c => !claimed[c] && (c.includes("code:") || root.bound[c]));
++                if (match.length === 0)
++                    continue;
++                // keep the file's own display form (e.g. "SUPER + 1…0" for a whole range)
++                const cat = category(fileCat.title, fileCat.icon);
++                cat.binds.push({ desc: b.desc, keys: b.keys });
++                for (const c of match)
++                    claimed[c] = true;
++            }
++        }
++
++        // 3. hyprlang dispatcher, 4. unlabelled
++        for (const combo of combos) {
++            if (claimed[combo])
++                continue;
++            const b = root.bound[combo];
++            if (b.dispatcher === "__lua")
++                add(category(Tr.tr("Unlabelled"), "help"), "", combo);
++            else
++                add(category(Tr.tr("Other"), "label"), Labels.describe(b.dispatcher, b.arg), combo);
++        }
++
++        // nothing labelled at all (Lua config without a label file): a hint beats a wall of bare keys
++        const labelled = out.some(c => c.binds.length > 0 && c.title !== Tr.tr("Unlabelled"));
++        if (combos.length > 0 && !labelled)
++            return [{
++                    title: Tr.tr("No labels yet"),
++                    icon: "info",
++                    binds: [{
++                            desc: Tr.tr("Your binds have no descriptions. Set up extras-cheatsheet.lua from caelestia-extras to label them."),
++                            keys: []
++                        }]
++                }];
++
++        return out.filter(c => c.binds.length > 0);
++    }
++
++    function show(): void {
++        // Hyprland.focusedMonitor can still be null right after start
++        screenName = Hyprland.focusedMonitor?.name ?? "";
++        open = true;
++    }
++
++    function hide(): void {
++        open = false;
++    }
++
++    // like the rule the shell sets for its drawers (Colours.reloadHyprRules): blur where
++    // the layer is at least as opaque as the card, so the dim scrim around it is not blurred
++    function applyBlurRule(): void {
++        let rule, enabled;
++        if (Hypr.usingLua) {
++            rule = `eval hl.layer_rule({ match = { namespace = "caelestia-cheatsheet" }, %1 = %2 })`;
++            enabled = glass;
++        } else {
++            rule = "keyword layerrule %1 %2, match:namespace caelestia-cheatsheet";
++            enabled = glass ? 1 : 0;
++        }
++        Hypr.extras.batchMessage([rule.arg("blur").arg(enabled), rule.arg("ignore_alpha").arg(((scrimAlpha + cardAlpha) / 2).toFixed(2))]);
++    }
++
++    onGlassChanged: applyBlurRule()
++
++    // "SHIFT + CTRL + ALT + SUPER + key", same order as normalise_combo() in hypr-user.lua
++    function normalise(bind: var): string {
++        const mods = [];
++        if (bind.modmask & 1)
++            mods.push("SHIFT");
++        if (bind.modmask & 4)
++            mods.push("CTRL");
++        if (bind.modmask & 8)
++            mods.push("ALT");
++        if (bind.modmask & 64)
++            mods.push("SUPER");
++        mods.push(bind.key.toLowerCase());
++        return mods.join(" + ");
++    }
++
++    FileView {
++        id: labels
++
++        path: `${Quickshell.env("XDG_RUNTIME_DIR")}/caelestia-cheatsheet.json`
++        printErrors: false // the file is optional
++        watchChanges: true
++        onFileChanged: reload()
++        onLoaded: {
++            try {
++                root.fileCategories = JSON.parse(text()).categories ?? [];
++            } catch (e) {
++                console.warn("cheatsheet: cannot parse", path, e);
++            }
++        }
++        onLoadFailed: root.fileCategories = []
++    }
++
++    Process {
++        id: binds
++
++        command: ["hyprctl", "binds", "-j"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                const out = {};
++                try {
++                    // keycode binds report an empty key, Caps/Num Lock OSD binds are non-consuming,
++                    // a release bind next to its press bind is the same shortcut
++                    for (const b of JSON.parse(text)) {
++                        if (b.submap || !b.key || b.non_consuming || b.key.startsWith("SUPER_"))
++                            continue;
++                        const combo = root.normalise(b);
++                        if (!out[combo] || (!out[combo].description && b.description))
++                            out[combo] = { description: b.description, dispatcher: b.dispatcher, arg: b.arg };
++                    }
++                } catch (e) {
++                    console.warn("cheatsheet: cannot parse hyprctl binds", e);
++                }
++                root.bound = out;
++            }
++        }
++    }
++
++    Process {
++        id: devices
++
++        command: ["hyprctl", "devices", "-j"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                try {
++                    const keyboards = JSON.parse(text).keyboards ?? [];
++                    const main = keyboards.find(k => k.main) ?? keyboards[0];
++                    root.modsSwapped = /altwin:swap_(alt_win|lalt_lwin)\b/.test(main?.options ?? "");
++                } catch (e) {
++                    console.warn("cheatsheet: cannot parse hyprctl devices", e);
++                }
++            }
++        }
++    }
++
++    // qmllint disable unresolved-type
++    CustomShortcut {
++        // qmllint enable unresolved-type
++        name: "cheatsheet"
++        description: "Toggle the keybind overview"
++        onPressed: root.open ? root.hide() : root.show()
++    }
++
++    IpcHandler {
++        function open(): void {
++            root.show();
++        }
++
++        function close(): void {
++            root.hide();
++        }
++
++        function toggle(): void {
++            root.open ? root.hide() : root.show();
++        }
++
++        // open with a search already filled in
++        function search(text: string): void {
++            if (!root.open)
++                root.show();
++            root.searchRequested(text);
++        }
++
++        target: "cheatsheet"
++    }
++
++    // one window per screen, always mapped like the shell's drawers; invisible and
++    // click-through while closed
++    Variants {
++        model: Quickshell.screens
++
++        StyledWindow {
++            id: win
++
++            required property ShellScreen modelData
++            // the focused screen, or the first one while Hyprland has not said yet
++            readonly property bool active: root.open && (root.screenName === modelData.name || !Quickshell.screens.some(s => s.name === root.screenName) && modelData === Quickshell.screens[0])
++            property string query
++
++            screen: modelData
++            name: "cheatsheet"
++            WlrLayershell.layer: WlrLayer.Overlay
++            // stays clear of the bar and the screen border: the window is the workspace area
++            WlrLayershell.exclusionMode: ExclusionMode.Normal
++            // the search field needs the keyboard
++            WlrLayershell.keyboardFocus: active ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
++            mask: active ? null : empty
++
++            anchors.top: true
++            anchors.bottom: true
++            anchors.left: true
++            anchors.right: true
++
++            Region {
++                id: empty
++            }
++
++            Connections {
++                target: root
++
++                function onSearchRequested(text: string): void {
++                    if (win.active)
++                        search.text = text;
++                }
++            }
++
++            Rectangle {
++                anchors.fill: parent
++                color: Qt.alpha(Colours.palette.m3scrim, win.active ? root.scrimAlpha : 0)
++
++                Behavior on color {
++                    CAnim {}
++                }
++            }
++
++            MouseArea {
++                anchors.fill: parent
++                onClicked: root.hide()
++            }
++
++            // the shadow fills the whole rect and would make the glass card opaque again
++            Elevation {
++                visible: !root.glass
++                anchors.fill: card
++                radius: card.radius
++                opacity: card.opacity
++                scale: card.scale
++                level: 4
++            }
++
++            StyledRect {
++                id: card
++
++                readonly property real pad: padFor(dense)
++                // at most 90 % of the workspace area
++                readonly property real maxWidth: Math.floor(win.width * 0.9)
++                readonly property real maxHeight: Math.floor(win.height * 0.9)
++                readonly property real colGap: Tokens.spacing.large
++                readonly property real maxColWidth: 370
++                // Everything has to fit on one screen, and scaling would blur the text. So when the
++                // columns are too tall: first more (narrower) columns, then the smaller font, then
++                // more columns again. Wrapped labels make rows taller, so the block heights are
++                // worked out with text probes; layouts would only settle on a later frame.
++                property var fit: null
++                readonly property bool dense: fit?.dense ?? false
++                readonly property int columnCount: fit?.columns ?? 1
++                readonly property real colWidth: fit?.colWidth ?? maxColWidth
++                readonly property string contentKey: `${maxWidth}x${maxHeight}|${root.modsSwapped}|${root.categoriesKey}`
++
++                onContentKeyChanged: Qt.callLater(refit)
++                Component.onCompleted: Qt.callLater(refit)
++
++                // dense: same font, tighter spacing, only when the normal spacing doesn't fit
++                function padFor(dense: bool): real {
++                    return dense ? Tokens.padding.large : Tokens.padding.extraLarge;
++                }
++
++                function headerGapFor(dense: bool): real {
++                    return dense ? Tokens.spacing.large : Tokens.spacing.extraLarge;
++                }
++
++                function refit(): void {
++                    if (maxWidth < 300 || maxHeight < 300 || allBlocks.length === 0 || fit?.key === contentKey)
++                        return;
++                    // same as the header row: the icon circle is its tallest part
++                    const headerHeight = Math.max(header.implicitHeight, headIcon.implicitHeight + Tokens.padding.medium * 2);
++                    let best = null;
++                    for (const dense of [false, true]) {
++                        const pad = padFor(dense);
++                        const gridSpace = maxHeight - pad * 2 - headerHeight - headerGapFor(dense);
++                        const minColWidth = dense ? 300 : 320;
++                        const base = Math.max(1, Math.floor((maxWidth - pad * 2 + colGap) / (maxColWidth + colGap)));
++                        for (let count = Math.min(base, allBlocks.length); count <= allBlocks.length; count++) {
++                            let width = Math.floor(Math.min(maxColWidth, (maxWidth - pad * 2 - (count - 1) * colGap) / count));
++                            // a single block would make the card too narrow for the header and the search field
++                            if (count === allBlocks.length) {
++                                const minGrid = Math.min(maxWidth, 2 * maxColWidth + colGap + pad * 2) - pad * 2;
++                                width = Math.max(width, Math.floor((minGrid - (count - 1) * colGap) / count));
++                            }
++                            if (width < minColWidth && count > base)
++                                break;
++                            const heights = allBlocks.map(b => blockHeight(b, width, dense));
++                            const candidate = { key: contentKey, dense, columns: count, colWidth: width, heights, height: packHeight(heights, count) };
++                            if (candidate.height <= gridSpace) {
++                                fit = candidate;
++                                return;
++                            }
++                            if (!best || candidate.height < best.height)
++                                best = candidate;
++                        }
++                    }
++                    // nothing fits: the shortest try, the columns scroll
++                    fit = best;
++                }
++
++                // mirrors Category and BindRow below; Infinity when a word or a title would
++                // run into the key chips
++                function blockHeight(block: var, width: real, dense: bool): real {
++                    const catPad = dense ? Tokens.padding.medium : Tokens.padding.large;
++                    const inner = width - catPad * 2;
++                    const chipHeight = chipProbe.implicitHeight + Tokens.padding.extraSmall * 1.5;
++                    const iconSize = iconProbe.implicitHeight + Tokens.padding.small * 2;
++                    titleProbe.text = block.title;
++                    if (iconSize + Tokens.spacing.medium + titleProbe.implicitWidth > inner)
++                        return Infinity;
++                    let height = catPad * 2 + Math.max(iconSize, titleProbe.implicitHeight) + Tokens.spacing.small;
++                    for (const bind of block.binds) {
++                        const chips = Labels.chips(bind.keys, root.modsSwapped);
++                        let chipsWidth = Math.max(0, chips.length - 1) * Tokens.spacing.extraSmall;
++                        for (const chip of chips) {
++                            chipProbe.text = chip;
++                            chipsWidth += Math.max(chipHeight, chipProbe.implicitWidth + Tokens.padding.small * 2);
++                        }
++                        // RowLayout hands out whole pixels, rounded down
++                        descProbe.width = Math.max(1, Math.floor(inner - chipsWidth - (chips.length ? Tokens.spacing.large : 0)));
++                        descProbe.text = bind.desc;
++                        if (descProbe.contentWidth > descProbe.width + 0.5)
++                            return Infinity;
++                        height += Math.max(descProbe.implicitHeight, chips.length ? chipHeight : 0) + Tokens.padding.extraSmall * (dense ? 1.5 : 2);
++                    }
++                    return height;
++                }
++
++                // tallest column when the blocks are spread by their heights
++                function packHeight(sizes: var, count: int): real {
++                    const cols = Array(count).fill(0);
++                    const used = Array(count).fill(0);
++                    for (const h of sizes.slice().sort((a, b) => b - a)) {
++                        let i = 0;
++                        for (let j = 1; j < count; j++)
++                            if (cols[j] < cols[i])
++                                i = j;
++                        cols[i] += h + (used[i]++ ? Tokens.spacing.large : 0);
++                    }
++                    return Math.max(...cols);
++                }
++
++                StyledText {
++                    id: descProbe
++
++                    visible: false
++                    wrapMode: Text.WordWrap
++                    font: Tokens.font.body.medium
++                }
++
++                StyledText {
++                    id: titleProbe
++
++                    visible: false
++                    font: Tokens.font.title.small
++                }
++
++                StyledText {
++                    id: chipProbe
++
++                    visible: false
++                    text: "Ag"
++                    font: Tokens.font.label.small
++                }
++
++                MaterialIcon {
++                    id: iconProbe
++
++                    visible: false
++                    text: "apps"
++                    fontStyle: Tokens.font.icon.medium
++                }
++
++                // long categories (e.g. "Unlabelled" without a label file) are split into blocks
++                function toBlocks(categories: var): var {
++                    const blockSize = 24;
++                    const out = [];
++                    for (const cat of categories)
++                        for (let i = 0; i < cat.binds.length; i += blockSize)
++                            out.push({ key: `${cat.title}#${i}`, title: cat.title, icon: cat.icon, binds: cat.binds.slice(i, i + blockSize) });
++                    return out;
++                }
++
++                // column count and card size follow the full list, so nothing jumps while typing
++                readonly property var allBlocks: toBlocks(root.categories)
++                readonly property var blocks: win.query === "" ? allBlocks : toBlocks(root.filterCategories(win.query))
++
++                // masonry: biggest block first into the shortest column,
++                // then each column back in the original order
++                readonly property var columns: {
++                    // nothing to lay out before the window has its size
++                    if (!fit)
++                        return [];
++                    const cols = Array.from({ length: columnCount }, () => ({ height: 0, cats: [] }));
++                    const measured = blocks === allBlocks && fit.heights.length === blocks.length;
++                    const cats = blocks.map((cat, index) => ({ cat, index, size: measured ? fit.heights[index] : cat.binds.length + 2 }));
++                    cats.sort((a, b) => b.size - a.size);
++                    for (const c of cats) {
++                        const target = cols.reduce((a, b) => b.height < a.height ? b : a);
++                        target.cats.push(c);
++                        target.height += c.size;
++                    }
++                    return cols.map(col => col.cats.sort((a, b) => a.index - b.index).map(c => c.cat));
++                }
++
++                anchors.centerIn: parent
++                width: columnCount * colWidth + (columnCount - 1) * colGap + pad * 2
++                // too tall for the screen: the columns scroll, the header stays
++                height: Math.min(maxHeight, header.implicitHeight + layout.spacing + Math.max(fit?.height ?? 0, grid.implicitHeight) + pad * 2)
++                radius: Tokens.rounding.extraLarge
++                color: Qt.alpha(Colours.palette.m3surface, root.cardAlpha)
++                clip: true
++
++                // hidden until a layout fits, then it fades in
++                readonly property bool shown: win.active && fit !== null
++
++                // the search is emptied once the card is gone, so the grid is whole again on
++                // the next open without rebuilding while it fades in
++                onOpacityChanged: if (opacity === 0 && !shown)
++                    search.clear()
++                onShownChanged: if (shown)
++                    search.forceActiveFocus()
++
++                opacity: shown ? 1 : 0
++                scale: shown ? 1 : 0.96
++
++                Behavior on opacity {
++                    Anim {
++                        type: Anim.DefaultEffects
++                    }
++                }
++
++                Behavior on scale {
++                    Anim {
++                        type: Anim.FastSpatial
++                    }
++                }
++
++                // swallow clicks on the card itself
++                MouseArea {
++                    anchors.fill: parent
++                }
++
++                ColumnLayout {
++                    id: layout
++
++                    anchors.fill: parent
++                    anchors.margins: card.pad
++                    spacing: card.headerGapFor(card.dense)
++
++                    RowLayout {
++                        id: header
++
++                        Layout.fillWidth: true
++                        spacing: Tokens.spacing.large
++
++                        StyledRect {
++                            implicitWidth: implicitHeight
++                            implicitHeight: headIcon.implicitHeight + Tokens.padding.medium * 2
++                            radius: Tokens.rounding.full
++                            color: Colours.palette.m3primary
++
++                            MaterialIcon {
++                                id: headIcon
++
++                                anchors.centerIn: parent
++                                text: "keyboard"
++                                color: Colours.palette.m3onPrimary
++                                fontStyle: Tokens.font.icon.large
++                            }
++                        }
++
++                        ColumnLayout {
++                            spacing: 0
++
++                            StyledText {
++                                text: Tr.tr("Keyboard shortcuts")
++                                font: Tokens.font.title.medium
++                            }
++
++                            StyledText {
++                                text: root.modsSwapped ? Tr.tr("Esc to close · Alt ⇄ Super swapped") : Tr.tr("Esc to close")
++                                color: Colours.palette.m3outline
++                                font: Tokens.font.body.small
++                            }
++                        }
++
++                        Item {
++                            Layout.fillWidth: true
++                        }
++
++                        SearchBar {
++                            id: search
++
++                            Layout.preferredWidth: Math.min(420, card.width / 3)
++                            placeholderText: Tr.tr("Search shortcuts")
++                            onTextChanged: win.query = text
++
++                            // first Esc clears the search, the second one closes
++                            Keys.onEscapePressed: {
++                                if (text)
++                                    clear();
++                                else
++                                    root.hide();
++                            }
++                        }
++                    }
++
++                    StyledFlickable {
++                        id: scroller
++
++                        Layout.fillWidth: true
++                        Layout.fillHeight: true
++                        contentWidth: width
++                        contentHeight: grid.implicitHeight
++                        interactive: contentHeight > height
++                        boundsBehavior: Flickable.StopAtBounds
++                        clip: true
++
++                        StyledScrollBar.vertical: StyledScrollBar {
++                            flickable: scroller
++                        }
++
++                        RowLayout {
++                            id: grid
++
++                            width: scroller.width
++                            spacing: card.colGap
++
++                            Repeater {
++                                model: card.columns
++
++                                ColumnLayout {
++                                    id: column
++
++                                    required property var modelData
++
++                                    Layout.alignment: Qt.AlignTop
++                                    Layout.preferredWidth: card.colWidth
++                                    Layout.maximumWidth: card.colWidth
++                                    spacing: Tokens.spacing.large
++
++                                    Repeater {
++                                        model: column.modelData
++
++                                        Category {
++                                            dense: card.dense
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++
++                StyledText {
++                    anchors.centerIn: parent
++                    anchors.verticalCenterOffset: header.implicitHeight / 2
++                    visible: win.query !== "" && card.blocks.length === 0
++                    text: Tr.tr("No matches for \"%1\"").arg(win.query)
++                    color: Colours.palette.m3outline
++                    font: Tokens.font.body.large
++                }
++            }
++        }
++    }
++
++    component Category: StyledRect {
++        id: category
++
++        required property var modelData
++        property bool dense
++        readonly property real pad: dense ? Tokens.padding.medium : Tokens.padding.large
++
++        Layout.fillWidth: true
++        implicitHeight: catLayout.implicitHeight + pad * 2
++        radius: Tokens.rounding.large
++        color: Qt.alpha(Colours.palette.m3surfaceContainerHigh, root.glass ? 0.5 : 1)
++
++        ColumnLayout {
++            id: catLayout
++
++            anchors.fill: parent
++            anchors.margins: category.pad
++            // the rows bring their own padding (and hover area)
++            spacing: 0
++
++            RowLayout {
++                Layout.bottomMargin: Tokens.spacing.small
++                spacing: Tokens.spacing.medium
++
++                StyledRect {
++                    implicitWidth: implicitHeight
++                    implicitHeight: catIcon.implicitHeight + Tokens.padding.small * 2
++                    radius: Tokens.rounding.full
++                    color: Colours.palette.m3primaryContainer
++
++                    MaterialIcon {
++                        id: catIcon
++
++                        anchors.centerIn: parent
++                        text: category.modelData.icon
++                        color: Colours.palette.m3onPrimaryContainer
++                        fontStyle: Tokens.font.icon.medium
++                    }
++                }
++
++                StyledText {
++                    text: category.modelData.title
++                    color: Colours.palette.m3primary
++                    font: Tokens.font.title.small
++                }
++            }
++
++            Repeater {
++                model: category.modelData.binds
++
++                BindRow {
++                    dense: category.dense
++                }
++            }
++        }
++    }
++
++    component BindRow: Item {
++        id: row
++
++        required property var modelData
++        property bool dense
++
++        Layout.fillWidth: true
++        implicitHeight: rowLayout.implicitHeight + Tokens.padding.extraSmall * (dense ? 1.5 : 2)
++
++        StateLayer {
++            anchors.fill: parent
++            anchors.leftMargin: -Tokens.padding.small
++            anchors.rightMargin: -Tokens.padding.small
++            radius: Tokens.rounding.small
++        }
++
++        RowLayout {
++            id: rowLayout
++
++            anchors.left: parent.left
++            anchors.right: parent.right
++            anchors.verticalCenter: parent.verticalCenter
++            spacing: Tokens.spacing.large
++
++            // long labels wrap onto a second line instead of being cut off
++            StyledText {
++                Layout.fillWidth: true
++                text: row.modelData.desc
++                color: Colours.palette.m3onSurface
++                font: Tokens.font.body.medium
++                wrapMode: Text.WordWrap
++            }
++
++            Row {
++                Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
++                spacing: Tokens.spacing.extraSmall
++
++                Repeater {
++                    model: Labels.chips(row.modelData.keys, root.modsSwapped)
++
++                    KeyChip {
++                        required property string modelData
++
++                        text: modelData
++                    }
++                }
++            }
++        }
++    }
++}
+--- /dev/null
++++ b/modules/cheatsheet/KeyChip.qml
+@@ -0,0 +1,22 @@
++import QtQuick
++import Caelestia.Config
++import qs.components
++import qs.services
++
++// caelestia-extras (cheatsheet): one key of a shortcut, e.g. "Super"
++StyledRect {
++    property alias text: label.text
++
++    implicitWidth: Math.max(implicitHeight, label.implicitWidth + Tokens.padding.small * 2)
++    implicitHeight: label.implicitHeight + Tokens.padding.extraSmall * 1.5
++    radius: Tokens.rounding.small
++    color: Colours.palette.m3secondaryContainer
++
++    StyledText {
++        id: label
++
++        anchors.centerIn: parent
++        color: Colours.palette.m3onSecondaryContainer
++        font: Tokens.font.label.small
++    }
++}
+--- /dev/null
++++ b/modules/cheatsheet/labels.js
+@@ -0,0 +1,149 @@
++.pragma library
++
++// caelestia-extras (cheatsheet): key names for the chips and readable
++// labels for hyprlang binds without a description
++
++const MODS = {
++    shift: "Shift",
++    ctrl: "Ctrl",
++    control: "Ctrl",
++    alt: "Alt",
++    super: "Super",
++};
++
++// xkb altwin:swap_alt_win / swap_lalt_lwin: the key Hyprland calls SUPER is
++// labelled Alt on the keyboard and the other way round
++const SWAPPED = {
++    Alt: "Super",
++    Super: "Alt",
++};
++
++const KEYS = {
++    left: "←",
++    right: "→",
++    up: "↑",
++    down: "↓",
++    return: "Enter",
++    space: "Space",
++    tab: "Tab",
++    escape: "Esc",
++    delete: "Del",
++    backspace: "⌫",
++    backslash: "\\",
++    comma: ",",
++    period: ".",
++    minus: "−",
++    equal: "=",
++    page_up: "PgUp",
++    page_down: "PgDn",
++    print: "Print",
++    mouse_up: "Scroll ↑",
++    mouse_down: "Scroll ↓",
++    "mouse:272": "Left click",
++    "mouse:273": "Right click",
++    "mouse:274": "Middle click",
++    xf86audioplay: "Play",
++    xf86audiopause: "Pause",
++    xf86audionext: "Next",
++    xf86audioprev: "Prev",
++    xf86audiostop: "Stop",
++    xf86audiomute: "Mute",
++    xf86audiomicmute: "Mic mute",
++    xf86audioraisevolume: "Vol +",
++    xf86audiolowervolume: "Vol −",
++    xf86monbrightnessup: "Bright +",
++    xf86monbrightnessdown: "Bright −",
++};
++
++function keyLabel(key) {
++    const lower = key.toLowerCase();
++    if (KEYS[lower])
++        return KEYS[lower];
++    if (key.length === 1)
++        return key.toUpperCase();
++    return key.charAt(0).toUpperCase() + key.slice(1);
++}
++
++// chips always in this order, whatever the config says
++const MOD_ORDER = ["Ctrl", "Alt", "Shift", "Super"];
++
++function parse(combo, swapped) {
++    const mods = [];
++    let key = "";
++    for (const raw of combo.split("+")) {
++        const part = raw.trim();
++        const mod = MODS[part.toLowerCase()];
++        if (mod)
++            mods.push(swapped ? (SWAPPED[mod] ?? mod) : mod);
++        else if (part)
++            key = keyLabel(part);
++    }
++    mods.sort((x, y) => MOD_ORDER.indexOf(x) - MOD_ORDER.indexOf(y));
++    return { mods, key };
++}
++
++const ARROWS = ["←", "→", "↑", "↓"];
++
++// Same modifiers everywhere: "Super ← → ↑ ↓" (up to four keys).
++// Otherwise only the first alternative, the line would get too long.
++function chips(combos, swapped) {
++    const parsed = (combos ?? []).map(c => parse(c, swapped)).filter(c => c.key);
++    if (parsed.length === 0)
++        return [];
++
++    const sameMods = parsed.every(c => c.mods.join() === parsed[0].mods.join());
++    let keys = sameMods ? parsed.slice(0, 4).map(c => c.key) : [parsed[0].key];
++    // a set of arrows reads better as one chip
++    if (keys.length > 1 && keys.every(k => ARROWS.includes(k)))
++        keys = [keys.join(" ")];
++    return parsed[0].mods.concat(keys);
++}
++
++const DIRECTIONS = { l: "left", r: "right", u: "up", d: "down" };
++
++// hyprlang dispatcher + argument -> short English label
++function describe(dispatcher, arg) {
++    const a = (arg ?? "").trim();
++    const dir = DIRECTIONS[a] ?? a;
++    switch (dispatcher) {
++    case "exec":
++    case "execr":
++        return `Run ${a.split(/\s+/)[0].split("/").pop()}`;
++    case "workspace":
++        return `Workspace ${a}`;
++    case "movetoworkspace":
++        return `Move window to workspace ${a}`;
++    case "movetoworkspacesilent":
++        return `Send window to workspace ${a}`;
++    case "togglespecialworkspace":
++        return `Toggle special workspace ${a}`.trim();
++    case "killactive":
++        return "Close window";
++    case "togglefloating":
++        return "Toggle floating";
++    case "fullscreen":
++        return "Fullscreen";
++    case "pin":
++        return "Pin window";
++    case "movefocus":
++        return `Focus ${dir}`;
++    case "movewindow":
++        return a ? `Move window ${dir}` : "Drag window";
++    case "resizeactive":
++        return `Resize window ${a}`;
++    case "resizewindow":
++        return "Drag to resize";
++    case "global":
++        return a.split(":").pop().replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, c => c.toUpperCase());
++    default:
++        return a ? `${dispatcher} ${a}` : dispatcher;
++    }
++}
++
++// key names as shown, for the search ("alt q" also finds a swapped Super + Q)
++function searchText(combos, swapped) {
++    return (combos ?? []).map(c => {
++        const p = parse(c, swapped);
++        return p.mods.concat(p.key).join(" ");
++    }).join(" ");
++}

@@ -1,0 +1,13 @@
+--- a/modules/bar/BarWrapper.qml
++++ b/modules/bar/BarWrapper.qml
+@@ -15,7 +15,9 @@
+     required property BarPopouts.Wrapper popouts
+     required property bool fullscreen
+ 
+-    readonly property bool disabled: Strings.testRegexList(Config.bar.excludedScreens, screen.name)
++    // caelestia-extras: the bar only lives on the leftmost active screen (topmost on a tie)
++    readonly property bool isLeftmost: Quickshell.screens.every(s => s === screen || s.x > screen.x || (s.x === screen.x && s.y >= screen.y))
++    readonly property bool disabled: !isLeftmost || Strings.testRegexList(Config.bar.excludedScreens, screen.name)
+ 
+     readonly property int clampedWidth: Math.max(Config.border.minThickness, implicitWidth)
+     readonly property int padding: Math.max(Tokens.padding.small, Config.border.thickness)

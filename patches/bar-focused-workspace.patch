@@ -1,0 +1,24 @@
+--- a/modules/bar/components/workspaces/Workspace.qml
++++ b/modules/bar/components/workspaces/Workspace.qml
+@@ -41,7 +41,8 @@
+         return mon && mon !== monitor;
+     }
+     readonly property color fgColour: {
+-        if (onOtherMonitor)
++        // caelestia-extras: the focused workspace is never dimmed, even on another monitor
++        if (onOtherMonitor && !focused)
+             return offMonitorColour;
+         if (focused || isOccupied || Config.bar.workspaces.occupiedBg)
+             return Colours.palette.m3onSurface;
+--- a/modules/bar/components/workspaces/Workspaces.qml
++++ b/modules/bar/components/workspaces/Workspaces.qml
+@@ -18,7 +18,8 @@
+ 
+     readonly property HyprlandMonitor monitor: Hypr.monitorFor(screen)
+     readonly property bool onSpecial: monitor?.lastIpcObject.specialWorkspace?.name !== ""
+-    readonly property int activeWsId: monitor.activeWorkspace?.id ?? 1
++    // caelestia-extras: with perMonitor off, highlight the globally focused workspace
++    readonly property int activeWsId: (Config.bar.workspaces.perMonitor ? monitor.activeWorkspace?.id : Hypr.activeWsId) ?? 1
+     readonly property int activeWsIdx: workspaceIndex(activeWsId)
+     readonly property int shown: Math.max(1, Config.bar.workspaces.shown)
+ 
