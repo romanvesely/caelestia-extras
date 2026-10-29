@@ -1,11 +1,10 @@
 # caelestia-extras
 
-<!-- TODO Roman: two or three sentences in your own words: what this is and why you made it -->
+I wanted a quick way to look up my Hyprland binds without digging through config files, so I built a cheatsheet overlay for Caelestia shell. A few small fixes for my two-monitor setup ended up here too. Everything is a patch you can install and remove on its own.
 
-<!-- TODO Roman: screenshot or short video of the cheatsheet -->
+![Cheatsheet](docs/cheatsheet.png)
 
 Small add-ons for [Caelestia shell](https://github.com/caelestia-dots/shell), installed as patches.
-Each feature can be installed on its own.
 
 | Feature | What it does |
 |---|---|
@@ -45,6 +44,10 @@ That binds `Super + H` and labels all default Caelestia binds.
 A different key and labels for your own binds go into `setup()`, see the top of [`hypr/extras-cheatsheet.lua`](hypr/extras-cheatsheet.lua).
 Binds without a label are listed under "Unlabelled".
 Binds with a description (hyprlang `bindd`) are labelled without the file.
+
+Type to search descriptions, categories and key names:
+
+![Cheatsheet search](docs/cheatsheet-search.png)
 
 The cheatsheet can also be opened with `caelestia shell cheatsheet toggle`.
 
